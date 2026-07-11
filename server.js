@@ -14,38 +14,52 @@ const anthropic = process.env.ANTHROPIC_API_KEY
 app.use(express.json());
 app.use(express.static('public'));
 
-// Per-user data lives here as one JSON file per Microsoft account — this is
-// what survives a browser reset or a switch to a different device/browser,
-// unlike localStorage which is tied to one browser profile.
+// Per-user data lives here as one JSON file per account (Microsoft or
+// Google) — this is what survives a browser reset or a switch to a
+// different device/browser, unlike localStorage which is tied to one
+// browser profile.
 const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// Never trust a client-supplied user id — ask Microsoft Graph who the token
-// actually belongs to, so one signed-in user can't read or overwrite another
-// user's saved data by just changing a request parameter.
-async function verifyGraphUserId(req) {
+// Never trust a client-supplied user id — ask the provider itself (Microsoft
+// Graph or Google) who the token actually belongs to, so one signed-in user
+// can't read or overwrite another user's saved data by just changing a
+// request parameter. The client says which provider it's using; that's not
+// a trust boundary since we still verify the token against the real
+// provider — a lie here just means the verification call fails (401), not
+// an impersonation.
+async function verifyUserId(req) {
   const authHeader = req.headers.authorization || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
   if (!token) return null;
+  const provider = req.headers['x-auth-provider'] === 'google' ? 'google' : 'microsoft';
   try {
+    if (provider === 'google') {
+      const meRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!meRes.ok) return null;
+      const me = await meRes.json();
+      return typeof me.sub === 'string' ? `google_${me.sub}` : null;
+    }
     const meRes = await fetch('https://graph.microsoft.com/v1.0/me', {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!meRes.ok) return null;
     const me = await meRes.json();
-    return typeof me.id === 'string' ? me.id : null;
+    return typeof me.id === 'string' ? `ms_${me.id}` : null;
   } catch {
     return null;
   }
 }
 
 function userDataPath(userId) {
-  if (!/^[0-9a-fA-F-]{20,40}$/.test(userId)) return null;
+  if (!/^(ms|google)_[0-9a-zA-Z-]{5,60}$/.test(userId)) return null;
   return path.join(DATA_DIR, `${userId}.json`);
 }
 
 app.get('/api/user-data', async (req, res) => {
-  const userId = await verifyGraphUserId(req);
+  const userId = await verifyUserId(req);
   if (!userId) return res.status(401).json({ error: 'Not authenticated.' });
   const filePath = userDataPath(userId);
   if (!filePath) return res.status(400).json({ error: 'Invalid user id.' });
@@ -59,7 +73,7 @@ app.get('/api/user-data', async (req, res) => {
 });
 
 app.post('/api/user-data', async (req, res) => {
-  const userId = await verifyGraphUserId(req);
+  const userId = await verifyUserId(req);
   if (!userId) return res.status(401).json({ error: 'Not authenticated.' });
   const filePath = userDataPath(userId);
   if (!filePath) return res.status(400).json({ error: 'Invalid user id.' });
@@ -100,7 +114,10 @@ app.post('/api/summarize', async (req, res) => {
     .map((m, i) => `${i + 1}. From: ${m.sender}\n   Subject: ${m.subject}\n   Snippet: ${m.snippet || ''}`)
     .join('\n\n');
 
-  const prompt = `Here are recent emails from a user's inbox:\n\n${emailBlock}\n\nRespond with ONLY valid JSON (no markdown fences) in this exact shape:\n{"summary": "a concise 2-3 sentence plain-English summary of what needs attention", "todos": [{"name": "short actionable task", "source": "sender name"}]}\nInclude at most 5 todos, only for emails that actually imply an action.`;
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+
+  const prompt = `Today's date is ${today}. Here are recent emails from a user's inbox:\n\n${emailBlock}\n\nRespond with ONLY valid JSON (no markdown fences) in this exact shape:\n{"summary": "a concise 2-3 sentence plain-English summary of what needs attention", "todos": [{"name": "short actionable task", "source": "sender name", "date": "YYYY-MM-DD or null"}]}\nInclude at most 5 todos, only for emails that actually imply an action. If an email suggests or implies a due date or deadline (including relative phrases like "by Friday" or "in 2 weeks"), resolve it to an actual date using today's date as the reference and put it in "date" — otherwise use null.`;
 
   try {
     const model = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
@@ -119,9 +136,16 @@ app.post('/api/summarize', async (req, res) => {
       parsed = match ? JSON.parse(match[0]) : { summary: text, todos: [] };
     }
 
+    const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+    const todos = (Array.isArray(parsed.todos) ? parsed.todos : []).map((t) => ({
+      name: t.name,
+      source: t.source,
+      date: dateRe.test(t.date) ? t.date : null,
+    }));
+
     res.json({
       summary: parsed.summary || '',
-      todos: Array.isArray(parsed.todos) ? parsed.todos : [],
+      todos,
     });
   } catch (err) {
     console.error('Anthropic API error:', err);

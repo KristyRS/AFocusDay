@@ -16,6 +16,72 @@ function colorForName(name) {
   return AVATAR_COLORS[hash % AVATAR_COLORS.length];
 }
 
+function decodeGmailBase64Url(data) {
+  try {
+    const binary = atob(data.replace(/-/g, '+').replace(/_/g, '/'));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder('utf-8').decode(bytes);
+  } catch {
+    return '';
+  }
+}
+// Strips <style>/<script> content (not just the tags — their contents are
+// raw CSS/JS and are exactly the "random code" that leaked through before),
+// HTML comments, then tags, then decodes the common entities so text like
+// &nbsp;/&amp; doesn't show up literally.
+function htmlToCleanText(html) {
+  let text = html
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<(br|\/p|\/div|\/tr|\/li)\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ');
+  text = text
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&zwnj;|&zwj;|&#8203;/gi, '');
+  return text
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+    .filter((line, idx, arr) => !(line === '' && arr[idx - 1] === ''))
+    .join('\n')
+    .trim();
+}
+// Gmail messages are a MIME tree, not a single body field — walk it looking
+// for a plain-text part first, falling back to a cleaned-up HTML-to-text
+// conversion so we never hand raw HTML/CSS/JS to the page (same
+// plain-text-only approach as Outlook).
+function extractGmailBody(payload) {
+  if (!payload) return '';
+  if (payload.mimeType === 'text/plain' && payload.body && payload.body.data) {
+    return decodeGmailBase64Url(payload.body.data);
+  }
+  if (Array.isArray(payload.parts)) {
+    const plain = payload.parts.find((p) => p.mimeType === 'text/plain');
+    if (plain && plain.body && plain.body.data) return decodeGmailBase64Url(plain.body.data);
+    // Only recurse into genuinely nested multipart containers — recursing
+    // into a plain leaf part here would skip the html-stripping branch
+    // below via extractGmailBody's own generic body.data fallback.
+    for (const part of payload.parts) {
+      if (Array.isArray(part.parts)) {
+        const nested = extractGmailBody(part);
+        if (nested) return nested;
+      }
+    }
+    const html = payload.parts.find((p) => p.mimeType === 'text/html');
+    if (html && html.body && html.body.data) {
+      return htmlToCleanText(decodeGmailBase64Url(html.body.data));
+    }
+  }
+  if (payload.body && payload.body.data) return decodeGmailBase64Url(payload.body.data);
+  return '';
+}
+
 // Warm pastel palette for task-category tags — Work stays neutral, the rest
 // cycle through peach/mint/lavender/blue so tags read as distinct at a glance.
 const CATEGORY_TAG_PALETTE = [
@@ -82,6 +148,9 @@ const App = {
   msalInstance: null,
   msalConfig: null,
   account: null,
+  googleClientId: null,
+  googleAccessToken: null,
+  authProvider: null, // 'microsoft' | 'google' | null
   history: {}, // real per-day focus record, persisted in localStorage — { 'YYYY-MM-DD': { focusSeconds, sessionsCompleted } }
   taskHistory: {}, // completed-task log, persisted — { 'YYYY-MM-DD': [{ name, tag }] }
   moodLog: {}, // mood check-ins, persisted — { 'YYYY-MM-DD': [{ time, mood }] }
@@ -169,6 +238,7 @@ const App = {
   async initMsal() {
     const res = await fetch('/api/config');
     this.msalConfig = await res.json();
+    this.googleClientId = this.msalConfig.googleClientId || '';
 
     if (!this.msalConfig.clientId) {
       this.setState({ signInError: 'Server has no MSAL_CLIENT_ID configured yet (.env).' });
@@ -189,6 +259,7 @@ const App = {
     const accounts = this.msalInstance.getAllAccounts();
     if (accounts.length > 0) {
       this.account = accounts[0];
+      this.authProvider = 'microsoft';
       this.msalInstance.setActiveAccount(this.account);
       await this.loadProfileAndInbox();
       this.setState({ screen: 'home' });
@@ -204,6 +275,7 @@ const App = {
     try {
       const result = await this.msalInstance.loginPopup({ scopes: ['User.Read', 'Mail.Read'] });
       this.account = result.account;
+      this.authProvider = 'microsoft';
       this.msalInstance.setActiveAccount(this.account);
       await this.loadProfileAndInbox();
       this.setState({ screen: 'home', signingIn: false });
@@ -281,6 +353,103 @@ const App = {
     }
   },
 
+  // ---------- Google sign-in (Gmail) ----------
+
+  async signInWithGoogle() {
+    if (!this.googleClientId) {
+      this.setState({ signInError: 'Server has no GOOGLE_CLIENT_ID configured yet (.env).' });
+      return;
+    }
+    if (!window.google || !google.accounts || !google.accounts.oauth2) {
+      this.setState({ signInError: 'Google sign-in is still loading — try again in a moment.' });
+      return;
+    }
+    this.setState({ signingIn: true, signInError: '' });
+    const tokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: this.googleClientId,
+      scope: [
+        'https://www.googleapis.com/auth/gmail.readonly',
+        'https://www.googleapis.com/auth/userinfo.profile',
+        'https://www.googleapis.com/auth/userinfo.email',
+      ].join(' '),
+      callback: async (response) => {
+        if (response.error) {
+          this.setState({ signingIn: false, signInError: response.error_description || 'Google sign-in failed.' });
+          return;
+        }
+        this.googleAccessToken = response.access_token;
+        this.authProvider = 'google';
+        await this.loadGoogleProfileAndInbox();
+        this.setState({ screen: 'home', signingIn: false });
+      },
+    });
+    tokenClient.requestAccessToken();
+  },
+
+  async loadGoogleProfileAndInbox() {
+    try {
+      const meRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+        headers: { Authorization: `Bearer ${this.googleAccessToken}` },
+      });
+      const me = await meRes.json();
+      const name = me.name || me.email || 'Signed in';
+      this.state.userName = name;
+      this.state.userInitial = (name.trim()[0] || '?').toUpperCase();
+    } catch (err) {
+      console.error('Failed to load Google profile:', err);
+      this.state.userName = 'Signed in';
+      this.state.userInitial = '?';
+    }
+
+    await this.loadUserDataFromServer();
+
+    try {
+      const now = new Date();
+      const startOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay());
+      const afterSeconds = Math.floor(startOfWeek.getTime() / 1000);
+      const listRes = await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=50&q=${encodeURIComponent(`in:inbox after:${afterSeconds}`)}`,
+        { headers: { Authorization: `Bearer ${this.googleAccessToken}` } }
+      );
+      if (!listRes.ok) throw new Error(`Gmail list request failed (${listRes.status})`);
+      const listData = await listRes.json();
+      const ids = (listData.messages || []).map((m) => m.id);
+      const messages = await Promise.all(ids.map(async (id) => {
+        const msgRes = await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`,
+          { headers: { Authorization: `Bearer ${this.googleAccessToken}` } }
+        );
+        return msgRes.ok ? msgRes.json() : null;
+      }));
+      this.state.emails = messages.filter(Boolean).map((m) => {
+        const headers = (m.payload && m.payload.headers) || [];
+        const getHeader = (name) => (headers.find((h) => h.name.toLowerCase() === name.toLowerCase()) || {}).value || '';
+        const fromHeader = getHeader('From');
+        const senderMatch = fromHeader.match(/^"?([^"<]*)"?\s*<?([^>]*)>?$/);
+        const senderName = (senderMatch && senderMatch[1].trim()) || fromHeader || 'Unknown sender';
+        const receivedAt = new Date(Number(m.internalDate));
+        const isRead = !(m.labelIds || []).includes('UNREAD');
+        return {
+          id: m.id,
+          sender: senderName,
+          subject: getHeader('Subject') || '(no subject)',
+          snippet: m.snippet || '',
+          body: extractGmailBody(m.payload) || m.snippet || '',
+          receivedAt,
+          time: receivedAt.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }),
+          isRead,
+          initial: (senderName.trim()[0] || '?').toUpperCase(),
+          avatarColor: colorForName(senderName),
+        };
+      }).sort((a, b) => b.receivedAt - a.receivedAt);
+      this.state.emailFetchError = '';
+    } catch (err) {
+      console.error('Failed to load Gmail inbox:', err);
+      this.state.emailFetchError = 'Could not read your Gmail inbox (' + err.message + ').';
+      this.state.emails = [];
+    }
+  },
+
   // ---------- Server-side data sync (durable, per-account storage) ----------
 
   collectUserData() {
@@ -322,10 +491,18 @@ const App = {
     this.saveStats();
     this.saveEmailNotes();
   },
+  // Works for whichever provider is currently signed in — the server
+  // verifies the token against that same provider, so this can't be used
+  // to spoof another account.
+  async getSyncAuthToken() {
+    if (this.authProvider === 'google') return { token: this.googleAccessToken, provider: 'google' };
+    return { token: await this.getGraphToken(['User.Read']), provider: 'microsoft' };
+  },
   async loadUserDataFromServer() {
     try {
-      const token = await this.getGraphToken(['User.Read']);
-      const res = await fetch('/api/user-data', { headers: { Authorization: `Bearer ${token}` } });
+      const { token, provider } = await this.getSyncAuthToken();
+      if (!token) throw new Error('No auth token available');
+      const res = await fetch('/api/user-data', { headers: { Authorization: `Bearer ${token}`, 'X-Auth-Provider': provider } });
       if (!res.ok) throw new Error(`Server returned ${res.status}`);
       const { data } = await res.json();
       this.applyUserData(data);
@@ -337,10 +514,11 @@ const App = {
   },
   async saveUserDataToServer() {
     try {
-      const token = await this.getGraphToken(['User.Read']);
+      const { token, provider } = await this.getSyncAuthToken();
+      if (!token) throw new Error('No auth token available');
       const res = await fetch('/api/user-data', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'X-Auth-Provider': provider },
         body: JSON.stringify({ data: this.collectUserData() }),
       });
       if (!res.ok) throw new Error(`Server returned ${res.status}`);
@@ -365,15 +543,19 @@ const App = {
   },
 
   async signOut() {
-    if (this.account) await this.saveUserDataToServer();
+    if (this.authProvider) await this.saveUserDataToServer();
     try {
-      if (this.msalInstance && this.account) {
+      if (this.authProvider === 'google' && this.googleAccessToken && window.google) {
+        google.accounts.oauth2.revoke(this.googleAccessToken);
+      } else if (this.msalInstance && this.account) {
         await this.msalInstance.logoutPopup({ account: this.account });
       }
     } catch (err) {
       console.error('Sign-out warning:', err);
     }
     this.account = null;
+    this.googleAccessToken = null;
+    this.authProvider = null;
     this.setState({
       screen: 'onboarding',
       userName: '',
@@ -389,8 +571,10 @@ const App = {
   // ---------- Real AI summary (Claude, via server proxy) ----------
 
   async generateSummary() {
-    if (this.state.emails.length === 0) {
-      this.setState({ aiStage: 'error', aiError: 'No emails to summarize yet.' });
+    const last24hCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const recentEmails = this.state.emails.filter((e) => e.receivedAt >= last24hCutoff);
+    if (recentEmails.length === 0) {
+      this.setState({ aiStage: 'error', aiError: 'No emails from the last 24 hours to summarize.' });
       return;
     }
     this.setState({ aiStage: 'generating' });
@@ -399,7 +583,7 @@ const App = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          emails: this.state.emails.map((e) => ({ sender: e.sender, subject: e.subject, snippet: e.snippet })),
+          emails: recentEmails.map((e) => ({ sender: e.sender, subject: e.subject, snippet: e.snippet })),
         }),
       });
       const data = await res.json();
@@ -407,7 +591,7 @@ const App = {
       this.setState({
         aiStage: 'ready',
         aiSummaryText: data.summary,
-        suggestedTodos: (data.todos || []).map((t, i) => ({ id: 5000 + i, name: t.name, source: t.source, added: false })),
+        suggestedTodos: (data.todos || []).map((t, i) => ({ id: 5000 + i, name: t.name, source: t.source, date: t.date || null, added: false })),
       });
     } catch (err) {
       console.error('Summary generation failed:', err);
@@ -420,7 +604,7 @@ const App = {
     if (!todo || todo.added) return;
     const nextId = Math.max(0, ...this.state.tasks.map((t) => t.id)) + 1;
     todo.added = true;
-    this.state.tasks.push({ id: nextId, name: todo.name, done: false, tag: 'Mail', subtasks: [], date: null });
+    this.state.tasks.push({ id: nextId, name: todo.name, done: false, tag: 'Mail', subtasks: [], date: todo.date || null });
     this.render();
   },
 
@@ -1279,10 +1463,14 @@ const App = {
       <div style="flex:1;display:flex;align-items:center;justify-content:center;background:${T.onboardingBg}">
         <div style="width:400px;display:flex;flex-direction:column;align-items:center;text-align:center;animation:popIn .4s cubic-bezier(.2,.8,.2,1)">
           <div style="margin-bottom:20px">${this.renderLogo(30, T.accentText)}</div>
-          <div style="font-size:15px;line-height:1.5;color:${T.textMuted};margin-bottom:36px">Plan your day, protect your attention, and track every focused minute — synced with your Microsoft account.</div>
-          <div class="signin-btn" onclick="${s.signingIn ? '' : 'App.signIn()'}" style="width:100%;box-sizing:border-box;display:flex;align-items:center;justify-content:center;gap:10px;padding:13px 20px;background:${T.cardBg};color:${T.text};border:1px solid ${T.cardBorder};border-radius:11px;font-weight:600;font-size:14.5px;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,0.04)">
+          <div style="font-size:15px;line-height:1.5;color:${T.textMuted};margin-bottom:36px">Plan your day, protect your attention, and track every focused minute — synced with your Outlook or Gmail account.</div>
+          <div class="signin-btn" onclick="${s.signingIn ? '' : 'App.signIn()'}" style="width:100%;box-sizing:border-box;display:flex;align-items:center;justify-content:center;gap:10px;padding:13px 20px;background:${T.cardBg};color:${T.text};border:1px solid ${T.cardBorder};border-radius:11px;font-weight:600;font-size:14.5px;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,0.04);margin-bottom:10px">
             <svg width="18" height="18" viewBox="0 0 21 21"><rect x="1" y="1" width="9" height="9" fill="#f25022"></rect><rect x="11" y="1" width="9" height="9" fill="#7fba00"></rect><rect x="1" y="11" width="9" height="9" fill="#00a4ef"></rect><rect x="11" y="11" width="9" height="9" fill="#ffb900"></rect></svg>
             ${s.signingIn ? 'Signing in…' : 'Sign in with Microsoft'}
+          </div>
+          <div class="signin-btn" onclick="${s.signingIn ? '' : 'App.signInWithGoogle()'}" style="width:100%;box-sizing:border-box;display:flex;align-items:center;justify-content:center;gap:10px;padding:13px 20px;background:${T.cardBg};color:${T.text};border:1px solid ${T.cardBorder};border-radius:11px;font-weight:600;font-size:14.5px;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,0.04)">
+            <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.3 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34.5 6.5 29.5 4.5 24 4.5 13.2 4.5 4.5 13.2 4.5 24S13.2 43.5 24 43.5 43.5 34.8 43.5 24c0-1.2-.1-2.4-.4-3.5z"></path><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.6 19 12.5 24 12.5c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34.5 6.5 29.5 4.5 24 4.5c-7.7 0-14.4 4.4-17.7 10.2z"></path><path fill="#4CAF50" d="M24 43.5c5.4 0 10.3-1.9 14.1-5.4l-6.5-5.5C29.6 34.1 27 35 24 35c-5.3 0-9.7-3.3-11.3-8l-6.6 5.1C9.6 39 16.2 43.5 24 43.5z"></path><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.1-4.1 5.5l6.5 5.5C41.2 36 43.5 30.7 43.5 24c0-1.2-.1-2.4-.4-3.5z"></path></svg>
+            ${s.signingIn ? 'Signing in…' : 'Sign in with Google'}
           </div>
           ${s.signInError ? `<div style="font-size:12.5px;color:oklch(0.55 0.15 30);margin-top:14px">${esc(s.signInError)}</div>` : ''}
           <div style="font-size:12px;color:${T.textMuted};margin-top:20px">By continuing you agree to the Terms and Privacy Policy</div>
@@ -1769,9 +1957,9 @@ const App = {
               <div style="display:flex;align-items:center;gap:14px;padding:15px 22px;border-bottom:1px solid ${T.rowDivider}">
                 <div style="flex:1">
                   <div style="font-size:14.5px;font-weight:500;margin-bottom:3px">${esc(todo.name)}</div>
-                  <div style="font-size:12px;color:${T.textMuted}">From: ${esc(todo.source)}</div>
+                  <div style="font-size:12px;color:${T.textMuted}">From: ${esc(todo.source)}${todo.date ? ` · Due ${formatTaskDate(todo.date)}` : ''}</div>
                 </div>
-                <div onclick="App.addTodoToTasks(${todo.id})" style="font-size:12.5px;font-weight:600;color:${todo.added ? T.textMuted : T.accentText};cursor:pointer;padding:7px 14px;border-radius:8px;border:1.5px solid ${todo.added ? T.unselectedBorder : '${T.accentSolid}'};background:${todo.added ? T.rowDivider : T.accentSoftBg}">${todo.added ? 'Added' : 'Add to tasks'}</div>
+                <div onclick="App.addTodoToTasks(${todo.id})" style="font-size:12.5px;font-weight:600;color:${todo.added ? T.textMuted : T.accentText};cursor:pointer;padding:7px 14px;border-radius:8px;border:1.5px solid ${todo.added ? T.unselectedBorder : T.accentSolid};background:${todo.added ? T.rowDivider : T.accentSoftBg}">${todo.added ? 'Added' : 'Add to tasks'}</div>
               </div>`).join('')}
           </div>` : ''}
 
@@ -2388,7 +2576,7 @@ const App = {
     this.saveTasks();
     this.saveEvents();
     this.saveReminders();
-    if (this.account) this.maybeSyncToServer();
+    if (this.authProvider) this.maybeSyncToServer();
   },
 
   // ---------- Time roller (Setup screen) ----------
@@ -2450,5 +2638,5 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 window.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden' && App.account) App.syncToServerNow();
+  if (document.visibilityState === 'hidden' && App.authProvider) App.syncToServerNow();
 });
