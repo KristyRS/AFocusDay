@@ -52,6 +52,20 @@ function htmlToCleanText(html) {
     .join('\n')
     .trim();
 }
+// Microsoft Graph's plain-text conversion renders links as "[Label]<url>" —
+// fine for a short legitimate link, but marketing email tracking links carry
+// huge encoded query strings that read as a wall of "code" once inlined.
+// The label is what a reader actually needs; the raw tracking URL is noise.
+function cleanOutlookPlainText(text) {
+  return text
+    .replace(/\[([^\]\n]{0,120})\]\s*<[^>\n]+>/g, '$1')
+    .replace(/<https?:\/\/[^>\n]+>/gi, '')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+    .filter((line, idx, arr) => !(line === '' && arr[idx - 1] === ''))
+    .join('\n')
+    .trim();
+}
 // Gmail messages are a MIME tree, not a single body field — walk it looking
 // for a plain-text part first, falling back to a cleaned-up HTML-to-text
 // conversion so we never hand raw HTML/CSS/JS to the page (same
@@ -337,7 +351,7 @@ const App = {
           sender: senderName,
           subject: m.subject || '(no subject)',
           snippet: m.bodyPreview || '',
-          body: (m.body && m.body.content) || m.bodyPreview || '',
+          body: cleanOutlookPlainText((m.body && m.body.content) || m.bodyPreview || ''),
           receivedAt: new Date(m.receivedDateTime),
           time: new Date(m.receivedDateTime).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }),
           isRead: m.isRead !== false,
