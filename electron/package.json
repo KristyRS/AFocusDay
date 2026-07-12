@@ -1,0 +1,21 @@
+{
+  "name": "a-focus-day-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Desktop shell for A Focus Day — opens the hosted app in a native window",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "build": {
+    "appId": "com.afocusday.desktop",
+    "productName": "A Focus Day",
+    "files": ["main.js"],
+    "directories": { "output": "dist" }
+  },
+  "devDependencies": {
+    "electron": "^32.0.0",
+    "electron-builder": "^25.0.0"
+  }
+}
