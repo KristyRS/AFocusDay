@@ -1,15 +1,46 @@
 # A Focus Day
 
-A small local web app: real Microsoft sign-in (MSAL) that reads your Outlook
-inbox, and a real Claude API call that turns it into a summary + suggested
-to-dos. The Anthropic API key lives only on the server (`server.js`) — it is
-never sent to the browser.
+A calm, all-in-one productivity app — tasks, habits, a calendar, mood
+tracking, and a focus timer, with real Microsoft/Google sign-in and
+Claude-powered inbox summaries that turn your emails into to-dos and
+events. The Anthropic API key lives only on the server (`server.js`) — it
+is never sent to the browser.
 
-## 1. Configure Microsoft sign-in
+## Just want to use it?
 
-You said you already have an Azure AD (Entra ID) app registration. Make sure
-it's set up like this in the [Azure Portal](https://portal.azure.com) →
-**Entra ID → App registrations → your app**:
+- **Web**: [afocusday.onrender.com](https://afocusday.onrender.com)
+- **Desktop (Windows)**: download the installer from
+  [Releases](https://github.com/KristyRS/AFocusDay/releases) — it opens
+  the hosted app above in its own window, so there's no setup or API key
+  needed on your end. The installer isn't code-signed, so Windows
+  SmartScreen will warn you the first time — click **"More info" → "Run
+  anyway."**
+
+Sign in with Microsoft or Google and your data follows your account
+across devices. Everything below is only needed if you want to run your
+own copy for development.
+
+## Features
+
+- **Tasks** — due dates, subtasks, categories, inline editing
+- **Habits** — daily check-ins, streaks, weekly targets
+- **Calendar** — day/month/year views, multi-day events, and an AI scan
+  that proposes events/deadlines found in your inbox
+- **Focus timer** — Pomodoro-style sessions with optional breaks and
+  cycles
+- **Mood tracking** — log how you're feeling anytime, see the trend over
+  the day
+- **Inbox** — real Outlook mail, Claude-generated summaries and to-dos
+- **Stats** — focus time, completed/unfinished tasks, and habit history
+  by day
+
+## Running your own copy
+
+### 1. Configure Microsoft sign-in
+
+You need an Azure AD (Entra ID) app registration. Set it up like this in
+the [Azure Portal](https://portal.azure.com) → **Entra ID → App
+registrations → your app**:
 
 - **Authentication** → add a platform → **Single-page application (SPA)**
   → redirect URI `http://localhost:3000` (must match `MSAL_REDIRECT_URI`
@@ -20,12 +51,18 @@ it's set up like this in the [Azure Portal](https://portal.azure.com) →
 - Copy the **Application (client) ID** and **Directory (tenant) ID** from
   the app's **Overview** page.
 
-## 2. Configure the Anthropic API key
+### 2. Configure Google sign-in (optional)
+
+Create an OAuth 2.0 Client ID (type: Web application) in the
+[Google Cloud Console](https://console.cloud.google.com), with
+`http://localhost:3000` (or your real domain) as an authorized origin.
+
+### 3. Configure the Anthropic API key
 
 Get a key from [console.anthropic.com](https://console.anthropic.com) →
 API Keys.
 
-## 3. Fill in `.env`
+### 4. Fill in `.env`
 
 ```
 cp .env.example .env
@@ -38,6 +75,8 @@ MSAL_CLIENT_ID=<your Application (client) ID>
 MSAL_TENANT_ID=<your Directory (tenant) ID, or "common" for any Microsoft account>
 MSAL_REDIRECT_URI=http://localhost:3000
 
+GOOGLE_CLIENT_ID=<your Google OAuth Client ID, optional>
+
 ANTHROPIC_API_KEY=<your Anthropic API key>
 ANTHROPIC_MODEL=claude-sonnet-4-6
 
@@ -46,18 +85,30 @@ PORT=3000
 
 `.env` is gitignored — it stays on your machine only.
 
-## 4. Run it
+### 5. Run it
 
 ```
 npm install
 npm start
 ```
 
-Open http://localhost:3000. Click **Sign in with Microsoft**, approve the
-`User.Read` / `Mail.Read` consent prompt, and you'll land on the real Home
-screen with your real name. Go to **Inbox** to see your actual recent
-Outlook mail, then click **Generate summary & to-dos** to have Claude read
-those emails and propose a summary and action items.
+Open http://localhost:3000. Sign in with Microsoft or Google, then go to
+**Inbox** to see your actual recent mail and click **Generate summary &
+to-dos** to have Claude read it and propose a summary and action items.
+
+## Desktop app
+
+The `electron/` folder wraps the hosted app in a native window — no
+separate build of the backend, no API key shipped inside it. To build
+your own installer:
+
+```
+cd electron
+npm install
+npm run dist
+```
+
+The installer lands in `electron/dist/`.
 
 ## Notes
 
@@ -65,9 +116,10 @@ those emails and propose a summary and action items.
   Microsoft account without the right scope approved), the Inbox screen
   shows the specific Graph error instead of silently falling back to fake
   data.
-- Tasks, the focus timer, stats, and settings are local-only (in-memory)
-  and reset on page reload — only sign-in and the AI summary talk to real
-  services.
-- Everything else (tasks/timer/stats/settings) is unchanged from the
-  original design, just ported from the throwaway mockup into a real
-  Express + vanilla JS app so the login and AI pieces could be real.
+- Your tasks, habits, events, mood log, and settings are saved server-side
+  per signed-in account (`/api/user-data`), so they follow you across
+  devices and browser sessions — not just local to one browser.
+- On Render's free tier, that saved data lives on an ephemeral disk and
+  can be wiped on redeploys or after the service spins down from
+  inactivity. Fine for testing; for real persistence you'd want a paid
+  tier with a persistent disk, or a proper database.
