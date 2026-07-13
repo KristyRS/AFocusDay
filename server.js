@@ -17,8 +17,11 @@ app.use(express.static('public'));
 // Per-user data lives here as one JSON file per account (Microsoft or
 // Google) — this is what survives a browser reset or a switch to a
 // different device/browser, unlike localStorage which is tied to one
-// browser profile.
-const DATA_DIR = path.join(__dirname, 'data');
+// browser profile. In production this should point at a mounted
+// persistent disk (set DATA_DIR to its mount path) — the app directory
+// itself gets replaced on every deploy, so anything written next to the
+// code without a real disk behind it is lost on the next deploy.
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // Never trust a client-supplied user id — ask the provider itself (Microsoft
