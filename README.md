@@ -36,11 +36,6 @@ own copy for development.
 
 ## Running your own copy
 
-`http://localhost:3000` below is just for testing on your own machine.
-If you deploy your own copy somewhere public (like Render), use that
-deployment's real URL everywhere instead — see the note at the end of
-each step.
-
 ### 1. Configure Microsoft sign-in
 
 You need an Azure AD (Entra ID) app registration. Set it up like this in
@@ -48,9 +43,8 @@ the [Azure Portal](https://portal.azure.com) → **Entra ID → App
 registrations → your app**:
 
 - **Authentication** → add a platform → **Single-page application (SPA)**
-  → redirect URI `http://localhost:3000` for local testing (must match
-  `MSAL_REDIRECT_URI` below exactly, including the port) — or your real
-  deployment URL (e.g. `https://yourapp.onrender.com`) once it's live.
+  → redirect URI `https://afocusday.onrender.com` (must match
+  `MSAL_REDIRECT_URI` below exactly).
 - **API permissions** → add **Microsoft Graph → Delegated → `User.Read`**
   and **`Mail.Read`**. If your org requires admin consent, click
   **Grant admin consent** (or ask whoever manages the tenant to).
@@ -61,7 +55,7 @@ registrations → your app**:
 
 Create an OAuth 2.0 Client ID (type: Web application) in the
 [Google Cloud Console](https://console.cloud.google.com), with
-`http://localhost:3000` (or your real domain) as an authorized origin.
+`https://afocusday.onrender.com` as an authorized origin.
 
 ### 3. Configure the Anthropic API key
 
@@ -79,8 +73,7 @@ Then edit `.env`:
 ```
 MSAL_CLIENT_ID=<your Application (client) ID>
 MSAL_TENANT_ID=<your Directory (tenant) ID, or "common" for any Microsoft account>
-MSAL_REDIRECT_URI=http://localhost:3000
-# ^ swap this for your real deployment URL once it's live, e.g. https://yourapp.onrender.com
+MSAL_REDIRECT_URI=https://afocusday.onrender.com
 
 GOOGLE_CLIENT_ID=<your Google OAuth Client ID, optional>
 
@@ -99,8 +92,7 @@ npm install
 npm start
 ```
 
-Open http://localhost:3000 (or your real deployment URL, once it's live).
-Sign in with Microsoft or Google, then go to
+Open https://afocusday.onrender.com. Sign in with Microsoft or Google, then go to
 **Inbox** to see your actual recent mail and click **Generate summary &
 to-dos** to have Claude read it and propose a summary and action items.
 
